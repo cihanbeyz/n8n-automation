@@ -1,1 +1,1 @@
-# healthcare-ai-kit
+n8n automaton templates.
