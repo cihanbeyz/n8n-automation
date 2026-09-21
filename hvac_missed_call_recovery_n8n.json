@@ -1,0 +1,616 @@
+{
+  "name": "HVAC Missed Call Recovery Engine — Instant Text-Back + Intent Routing + No-Reply Escalation",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## \ud83d\udd25 HVAC Missed Call Recovery Engine\n\n**What this does, end to end:**\n1. Twilio tells us the instant a call ends. We detect if it was missed (no-answer, busy, voicemail, or hang-up before pickup).\n2. Within seconds we upsert the caller in GoHighLevel and text them back with a message that changes tone depending on business hours vs after-hours/emergency.\n3. We log every miss and ping the owner on Slack so nothing is invisible.\n4. If they reply, a second webhook parses their intent (emergency / repair / install / maintenance) and routes them: emergencies get an URGENT owner alert (and optionally an immediate outbound AI voice call), everyone else gets a booking link.\n5. If they DON'T reply within 20 minutes, we send one follow-up text and tell the owner to call manually \u2014 nobody falls through the cracks silently.\n\n**Setup checklist:**\n1. Twilio: on your HVAC number, set the Voice \u2192 Call Status Changes webhook to the Branch 1 webhook's production URL, method POST, and check 'completed', 'no-answer', 'busy', 'failed'.\n2. GoHighLevel: create a Private Integration token (Settings \u2192 Private Integrations) with scopes contacts.readonly, contacts.write, conversations.readonly, conversations.write, conversations/message.write. Use it as an HTTP Header Auth credential: header 'Authorization' = 'Bearer YOUR_TOKEN', and every GHL call also needs a 'Version' header (check GoHighLevel's current API docs for the latest date string \u2014 this changes).\n3. Point GoHighLevel's inbound SMS/conversation webhook (or Twilio's inbound message webhook, whichever you're using for replies) at the Branch 2 webhook's production URL.\n4. Replace every YOUR_* placeholder: locationId, owner phone/Slack channel, business hours, Vapi assistant ID if you wire in the emergency outbound call.\n5. GHL's exact contact-search and message endpoints shift between API versions \u2014 verify the two HTTP Request nodes marked \u26a0\ufe0f against GoHighLevel's current API v2 docs before going live.",
+        "height": 620,
+        "width": 560
+      },
+      "id": "note_main",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-2000, -200]
+    },
+
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hvac-missed-call",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh_call_status",
+      "name": "Twilio Call Status Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1360, 0],
+      "webhookId": "hvac-missed-call"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Twilio posts form-encoded fields on every call status change.\nconst b = $input.first().json.body || $input.first().json;\n\nconst callStatus = (b.CallStatus || '').toLowerCase();\nconst duration = parseInt(b.CallDuration || b.DialCallDuration || '0', 10);\nconst from = b.From || b.Caller || '';\nconst to = b.To || b.Called || '';\nconst callSid = b.CallSid || '';\nconst direction = b.Direction || 'inbound';\n\n// Missed = never answered, OR answered-and-hung-up in under 4s (rang once, hung up before pickup / voicemail beep).\nconst neverAnswered = ['no-answer', 'busy', 'failed'].includes(callStatus);\nconst bailedEarly = callStatus === 'completed' && duration > 0 && duration <= 4;\nconst isMissed = (neverAnswered || bailedEarly) && direction === 'inbound';\n\nreturn [{\n  json: {\n    isMissed,\n    callStatus,\n    duration,\n    callerPhone: from,\n    businessPhone: to,\n    callSid,\n    receivedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code_normalize_call",
+      "name": "Normalize Call Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1160, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "version": 2 },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.isMissed }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if_missed",
+      "name": "Is Missed Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-960, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond_ignore",
+      "name": "Ack — Call Was Answered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-760, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide tone + whether to flag this as an emergency-hours miss.\n// Business hours: Mon-Sat 8am-6pm local. Adjust to the shop's real hours.\nconst now = new Date();\nconst day = now.getDay(); // 0 = Sun\nconst hour = now.getHours();\n\nconst isBusinessHours = day >= 1 && day <= 6 && hour >= 8 && hour < 18;\n\nconst ownerName = 'YOUR_OWNER_NAME';\nconst businessName = 'YOUR_HVAC_COMPANY';\n\nconst message = isBusinessHours\n  ? `Hey, sorry we missed you! This is ${ownerName} from ${businessName}. Are you calling about AC repair, heating repair, installation, or maintenance? Reply and I'll get you sorted right away.`\n  : `Thanks for calling ${businessName}! We're closed right now but if this is a no-heat, no-cool, or leak emergency, reply EMERGENCY and we'll call you back immediately. Otherwise let us know what you need and we'll follow up first thing.`;\n\nreturn [{\n  json: {\n    ...$json,\n    isBusinessHours,\n    initialMessage: message,\n    ownerName,\n    businessName\n  }\n}];"
+      },
+      "id": "code_time_context",
+      "name": "Build Time-Aware Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-760, -60]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond_ack",
+      "name": "Ack Twilio Immediately",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-540, -220]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://services.leadconnectorhq.com/contacts/?locationId=YOUR_LOCATION_ID&query={{ encodeURIComponent($json.callerPhone) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http_ghl_search_contact",
+      "name": "\u26a0\ufe0f GHL: Search Contact by Phone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-540, 40]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "version": 2 },
+          "conditions": [
+            {
+              "leftValue": "={{ ($json.contacts || []).length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if_contact_exists",
+      "name": "Contact Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-320, 40]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ locationId: 'YOUR_LOCATION_ID', phone: $('Build Time-Aware Message').item.json.callerPhone, source: 'HVAC Missed Call', tags: ['missed-call-lead', 'hvac'] }) }}",
+        "options": {}
+      },
+      "id": "http_ghl_create_contact",
+      "name": "GHL: Create Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://services.leadconnectorhq.com/contacts/{{ $json.contacts[0].id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tags: [...(($json.contacts[0].tags)||[]), 'missed-call-lead'] }) }}",
+        "options": {}
+      },
+      "id": "http_ghl_update_contact",
+      "name": "GHL: Tag Existing Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-100, 160]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "merge_contact",
+      "name": "Merge Contact Branches",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [120, 20]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise whichever branch we came from into one clean shape.\nconst c = $input.first().json;\nconst contactId = c.id || c.contact?.id || (c.contacts && c.contacts[0] && c.contacts[0].id);\n\nreturn [{\n  json: {\n    ...$('Build Time-Aware Message').first().json,\n    contactId\n  }\n}];"
+      },
+      "id": "code_resolve_contact_id",
+      "name": "Resolve Contact ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 20]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'SMS', contactId: $json.contactId, message: $json.initialMessage }) }}",
+        "options": {}
+      },
+      "id": "http_ghl_send_sms1",
+      "name": "\u26a0\ufe0f GHL: Send Initial Text-Back",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [540, 20]
+    },
+    {
+      "parameters": {
+        "documentId": { "__rl": true, "value": "YOUR_LOG_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Missed_Calls", "mode": "name" },
+        "columns": { "mappingMode": "autoMapInputData", "value": {} },
+        "options": {}
+      },
+      "id": "sheets_log_missed",
+      "name": "Log Missed Call",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [780, -180]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: '#missed-calls', text: `\ud83d\udcde Missed call from ${$json.callerPhone} at ${new Date($json.receivedAt).toLocaleTimeString()}${$json.isBusinessHours ? '' : ' (after hours)'}. Auto text-back sent.` }) }}",
+        "options": {}
+      },
+      "id": "http_slack_alert_owner",
+      "name": "Alert Owner — Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 20]
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "minutes"
+      },
+      "id": "wait_followup",
+      "name": "Wait 20 Min For Reply",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [780, 260],
+      "webhookId": "hvac-wait-followup"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://services.leadconnectorhq.com/conversations/search?contactId={{ $json.contactId }}&locationId=YOUR_LOCATION_ID",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http_ghl_check_reply",
+      "name": "\u26a0\ufe0f GHL: Check For Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// unreadMessageCount / lastMessageDirection differ by GHL response shape;\n// this checks the conversation for any inbound message after our outbound send.\nconst c = $input.first().json;\nconst conv = (c.conversations && c.conversations[0]) || c;\nconst hasInboundReply = (conv.lastMessageType || conv.lastMessageDirection || '').toLowerCase().includes('inbound')\n  || (conv.unreadCount || 0) > 0;\n\nreturn [{ json: { ...$('Resolve Contact ID').first().json, hasInboundReply } }];"
+      },
+      "id": "code_check_replied",
+      "name": "Did They Reply?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1220, 260]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "version": 2 },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.hasInboundReply }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if_replied",
+      "name": "IF Replied",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1440, 260]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'SMS', contactId: $json.contactId, message: `Just checking in — still there? Want me to have a tech call you directly right now?` }) }}",
+        "options": {}
+      },
+      "id": "http_ghl_send_sms2",
+      "name": "GHL: Send Follow-up #2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1660, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: '#missed-calls', text: `\u26a0\ufe0f No reply from ${$json.callerPhone} after 20 minutes. Consider calling them directly — lead may go cold.` }) }}",
+        "options": {}
+      },
+      "id": "http_notify_owner_no_reply",
+      "name": "Notify Owner — No Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1880, 380]
+    },
+
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hvac-sms-reply",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh_sms_reply",
+      "name": "Inbound SMS Reply Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1360, 700],
+      "webhookId": "hvac-sms-reply"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Accepts either a GHL conversation-provider webhook or a raw Twilio inbound SMS webhook.\nconst b = $input.first().json.body || $input.first().json;\n\nconst text = (b.body || b.message?.body || b.Body || '').trim();\nconst contactId = b.contactId || b.contact_id || null;\nconst phone = b.phone || b.From || b.contact?.phone || '';\nconst lower = text.toLowerCase();\n\nlet intent = 'general';\nif (/emergenc|no heat|no cool|no ac|leak|flood|smoke|gas smell/.test(lower)) intent = 'emergency';\nelse if (/repair|fix|broken|not working/.test(lower)) intent = 'repair';\nelse if (/install|new system|replace|quote|estimate/.test(lower)) intent = 'install';\nelse if (/maintenance|tune.?up|service plan|check.?up/.test(lower)) intent = 'maintenance';\n\nreturn [{\n  json: { rawText: text, intent, contactId, phone, receivedAt: new Date().toISOString() }\n}];"
+      },
+      "id": "code_parse_intent",
+      "name": "Parse Reply Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1160, 700]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://services.leadconnectorhq.com/contacts/{{ $json.contactId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tags: ['replied', $json.intent] }) }}",
+        "options": {}
+      },
+      "id": "http_ghl_update_intent",
+      "name": "\u26a0\ufe0f GHL: Tag Contact With Intent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-960, 700]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "version": 2 },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "emergency",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "emergency"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "switch_intent",
+      "name": "Route By Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [-740, 700]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: '#urgent-hvac', text: `\ud83d\udea8 URGENT: ${$json.phone} replied: \"${$json.rawText}\" — this is flagged as an emergency. Call them now.` }) }}",
+        "options": {}
+      },
+      "id": "http_alert_owner_urgent",
+      "name": "URGENT Owner Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-500, 580]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.vapi.ai/call",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ assistantId: 'YOUR_EMERGENCY_ASSISTANT_ID', phoneNumberId: 'YOUR_PHONE_NUMBER_ID', customer: { number: $json.phone } }) }}",
+        "options": {}
+      },
+      "id": "http_trigger_vapi_outbound",
+      "name": "Optional: Vapi Calls Them Back Now",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-500, 800]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Version", "value": "2021-07-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'SMS', contactId: $json.contactId, message: $json.intent === 'general' ? `Got it, thanks! Someone will text you shortly with next steps.` : `Perfect — here's our booking link so you can grab a time that works: https://YOUR_BOOKING_LINK.com` }) }}",
+        "options": {}
+      },
+      "id": "http_send_booking_link",
+      "name": "Send Booking Link / Ack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-500, 950]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond_sms_ack",
+      "name": "Ack Inbound Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-260, 700]
+    }
+  ],
+
+  "connections": {
+    "Twilio Call Status Webhook": {
+      "main": [[{ "node": "Normalize Call Event", "type": "main", "index": 0 }]]
+    },
+    "Normalize Call Event": {
+      "main": [[{ "node": "Is Missed Call?", "type": "main", "index": 0 }]]
+    },
+    "Is Missed Call?": {
+      "main": [
+        [{ "node": "Build Time-Aware Message", "type": "main", "index": 0 }],
+        [{ "node": "Ack — Call Was Answered", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Time-Aware Message": {
+      "main": [
+        [
+          { "node": "Ack Twilio Immediately", "type": "main", "index": 0 },
+          { "node": "\u26a0\ufe0f GHL: Search Contact by Phone", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "\u26a0\ufe0f GHL: Search Contact by Phone": {
+      "main": [[{ "node": "Contact Exists?", "type": "main", "index": 0 }]]
+    },
+    "Contact Exists?": {
+      "main": [
+        [{ "node": "GHL: Tag Existing Contact", "type": "main", "index": 0 }],
+        [{ "node": "GHL: Create Contact", "type": "main", "index": 0 }]
+      ]
+    },
+    "GHL: Create Contact": {
+      "main": [[{ "node": "Merge Contact Branches", "type": "main", "index": 0 }]]
+    },
+    "GHL: Tag Existing Contact": {
+      "main": [[{ "node": "Merge Contact Branches", "type": "main", "index": 1 }]]
+    },
+    "Merge Contact Branches": {
+      "main": [[{ "node": "Resolve Contact ID", "type": "main", "index": 0 }]]
+    },
+    "Resolve Contact ID": {
+      "main": [[{ "node": "\u26a0\ufe0f GHL: Send Initial Text-Back", "type": "main", "index": 0 }]]
+    },
+    "\u26a0\ufe0f GHL: Send Initial Text-Back": {
+      "main": [
+        [
+          { "node": "Log Missed Call", "type": "main", "index": 0 },
+          { "node": "Alert Owner — Slack", "type": "main", "index": 0 },
+          { "node": "Wait 20 Min For Reply", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Wait 20 Min For Reply": {
+      "main": [[{ "node": "\u26a0\ufe0f GHL: Check For Reply", "type": "main", "index": 0 }]]
+    },
+    "\u26a0\ufe0f GHL: Check For Reply": {
+      "main": [[{ "node": "Did They Reply?", "type": "main", "index": 0 }]]
+    },
+    "Did They Reply?": {
+      "main": [[{ "node": "IF Replied", "type": "main", "index": 0 }]]
+    },
+    "IF Replied": {
+      "main": [
+        [],
+        [
+          { "node": "GHL: Send Follow-up #2", "type": "main", "index": 0 },
+          { "node": "Notify Owner — No Reply", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+
+    "Inbound SMS Reply Webhook": {
+      "main": [[{ "node": "Parse Reply Intent", "type": "main", "index": 0 }]]
+    },
+    "Parse Reply Intent": {
+      "main": [[{ "node": "\u26a0\ufe0f GHL: Tag Contact With Intent", "type": "main", "index": 0 }]]
+    },
+    "\u26a0\ufe0f GHL: Tag Contact With Intent": {
+      "main": [[{ "node": "Route By Intent", "type": "main", "index": 0 }]]
+    },
+    "Route By Intent": {
+      "main": [
+        [
+          { "node": "URGENT Owner Alert", "type": "main", "index": 0 },
+          { "node": "Optional: Vapi Calls Them Back Now", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Send Booking Link / Ack", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "URGENT Owner Alert": {
+      "main": [[{ "node": "Ack Inbound Webhook", "type": "main", "index": 0 }]]
+    },
+    "Optional: Vapi Calls Them Back Now": {
+      "main": [[{ "node": "Ack Inbound Webhook", "type": "main", "index": 0 }]]
+    },
+    "Send Booking Link / Ack": {
+      "main": [[{ "node": "Ack Inbound Webhook", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "tags": [
+    { "name": "hvac" },
+    { "name": "missed-call-recovery" }
+  ]
+}
