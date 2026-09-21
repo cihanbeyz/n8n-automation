@@ -1,0 +1,232 @@
+{
+  "name": "Missed Call Recovery Engine - HVAC (Fixed)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Bug Fixes Applied\n\n1. **Twilio SMS node** \u2014 added missing `resource: sms` / `operation: send`. Without these the node doesn't know it's supposed to send a text.\n2. **ownerName** \u2014 was referenced in the SMS message but never set anywhere. Added it in 'Prepare Lead Data' (replace YOUR_OWNER_NAME).\n3. **Phone number formatting** \u2014 the original stripped the '+' from the caller's number, then reused that broken format as the Twilio 'to' field. Twilio requires full E.164 (+15551234567) or the send fails. Fixed to keep the number intact.\n4. **Duplicate contacts** \u2014 changed GoHighLevel Contact operation from 'Create' to 'Create or Update' so a repeat caller updates their existing record instead of spawning a new one every call.\n5. **Missed-call detection widened** \u2014 the original only caught no-answer/busy/failed. Added the 'answered but hung up in under 5 seconds' case (voicemail bail / caller gave up before pickup), which is a real and common miss.\n\n\u26a0\ufe0f Verify before going live: the exact internal value for GoHighLevel's 'Create or Update' operation, and whether 'Create Opportunity' should read `$json.id` or `$json.contact.id` for the contact ID \u2014 this depends on your n8n/HighLevel node version, so test one run and check the actual output shape.",
+        "height": 380,
+        "width": 480
+      },
+      "id": "note-fixes",
+      "name": "README - Fixes Applied",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [250, -180]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "twilio-missed-call",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+      "name": "Twilio Call Status Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "twilio-missed-call-recovery"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "version": 2 },
+          "conditions": [
+            {
+              "leftValue": "={{ ['no-answer','busy','failed'].includes($json.body.CallStatus) || ($json.body.CallStatus === 'completed' && parseInt($json.body.CallDuration || '0', 10) <= 5) }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "2b3c4d5e-6f7a-8b9c-0d1e-2f3a4b5c6d7e",
+      "name": "Filter Missed Calls",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "callerPhone",
+              "value": "={{ $json.body.From }}"
+            },
+            {
+              "name": "calledNumber",
+              "value": "={{ $json.body.To }}"
+            },
+            {
+              "name": "callSid",
+              "value": "={{ $json.body.CallSid }}"
+            },
+            {
+              "name": "leadTag",
+              "value": "missed-call-lead"
+            },
+            {
+              "name": "ownerName",
+              "value": "YOUR_OWNER_NAME"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3c4d5e6f-7a8b-9c0d-1e2f-3a4b5c6d7e8f",
+      "name": "Prepare Lead Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "firstName": "HVAC Lead",
+        "lastName": "Missed Call",
+        "phone": "={{ $json.callerPhone }}",
+        "email": "",
+        "additionalFields": {
+          "tags": ["hvac-inbound-missed", "missed-call-lead"],
+          "customFields": [
+            {
+              "fieldKey": "called_phone_number",
+              "fieldValue": "={{ $json.calledNumber }}"
+            },
+            {
+              "fieldKey": "call_sid",
+              "fieldValue": "={{ $json.callSid }}"
+            }
+          ]
+        }
+      },
+      "id": "4d5e6f7a-8b9c-0d1e-2f3a-4b5c6d7e8f9a",
+      "name": "Create or Update Lead in GoHighLevel",
+      "type": "n8n-nodes-base.highLevel",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "highLevelOAuth2Api": {
+          "id": "YOUR_GHL_CREDENTIAL_ID",
+          "name": "GoHighLevel account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "opportunity",
+        "operation": "create",
+        "pipelineId": "YOUR_PIPELINE_ID",
+        "pipelineStageId": "YOUR_STAGE_ID",
+        "contactId": "={{ $json.id }}",
+        "name": "=Missed Call - {{ $('Prepare Lead Data').item.json.callerPhone }} - {{ $now.toFormat('MM/dd/yyyy HH:mm') }}",
+        "status": "open",
+        "monetaryValue": 0
+      },
+      "id": "5e6f7a8b-9c0d-1e2f-3a4b-5c6d7e8f9a0b",
+      "name": "Create Opportunity in GoHighLevel",
+      "type": "n8n-nodes-base.highLevel",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "highLevelOAuth2Api": {
+          "id": "YOUR_GHL_CREDENTIAL_ID",
+          "name": "GoHighLevel account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "sms",
+        "operation": "send",
+        "from": "YOUR_TWILIO_NUMBER",
+        "to": "={{ $('Prepare Lead Data').item.json.callerPhone }}",
+        "message": "=Hey, sorry I missed you! Are you looking for AC repair or installation? - {{ $('Prepare Lead Data').item.json.ownerName }}",
+        "options": {}
+      },
+      "id": "6f7a8b9c-0d1e-2f3a-4b5c-6d7e8f9a0b1c",
+      "name": "Send SMS via Twilio",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "credentials": {
+        "twilioApi": {
+          "id": "YOUR_TWILIO_CREDENTIAL_ID",
+          "name": "Twilio account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Twilio Call Status Webhook": {
+      "main": [
+        [
+          {
+            "node": "Filter Missed Calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Missed Calls": {
+      "main": [
+        [
+          {
+            "node": "Prepare Lead Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Lead Data": {
+      "main": [
+        [
+          {
+            "node": "Create or Update Lead in GoHighLevel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create or Update Lead in GoHighLevel": {
+      "main": [
+        [
+          {
+            "node": "Create Opportunity in GoHighLevel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Opportunity in GoHighLevel": {
+      "main": [
+        [
+          {
+            "node": "Send SMS via Twilio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "your-instance-id"
+  },
+  "pinData": {},
+  "versionId": "1",
+  "triggerCount": 1,
+  "tags": [],
+  "active": false
+}
